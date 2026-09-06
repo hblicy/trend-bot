@@ -327,7 +327,7 @@ def detect_capitulation(row, df: pd.DataFrame | None = None, *, safe_idx: int = 
             and row.get("lower_shadow", 0) > PRICE_VOLATILITY * row["close"]
         )
         rsi_oversold = row.get("RSI", 100) < RSI_OVERSOLD
-        rsi_div, volume_surge, macd_imp = False, True, True
+        rsi_div, volume_surge, macd_imp = False, False, False
         if df is not None and len(df) > 5:
             # 转正索引
             idx = len(df) + safe_idx if safe_idx < 0 else safe_idx

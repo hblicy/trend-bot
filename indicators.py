@@ -99,7 +99,8 @@ def _adx(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) ->
 def _bbands(series: pd.Series, length: int = 20, std: float = 2.0) -> pd.DataFrame:
     """Bollinger Bands (布林带)"""
     mid = series.rolling(window=length).mean()
-    rolling_std = series.rolling(window=length).std()
+    # ddof=0 与 TA-Lib / TradingView 布林带口径一致（pandas 默认 ddof=1 会略宽）
+    rolling_std = series.rolling(window=length).std(ddof=0)
     upper = mid + std * rolling_std
     lower = mid - std * rolling_std
     bandwidth = ((upper - lower) / mid.replace(0, np.nan)) * 100

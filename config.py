@@ -68,7 +68,7 @@ FIRST_REPORT_HOUR = 8    # 第一次报告时间：上午8点
 SECOND_REPORT_HOUR = 16  # 第二次报告时间：下午4点
 THIRD_REPORT_HOUR = 0    # 第三次报告时间：凌晨0点
 REPORT_MINUTE = 0
-# 报告时间所在的时区，schedule 会自动转换为机器本地时间触发
+# 报告时间所在的时区；运行时每分钟按此时区判断，不依赖机器本地时区
 REPORT_TIMEZONE = 'Asia/Shanghai'
 
 # 是否启用趋势变化告警
@@ -89,12 +89,12 @@ WECHAT_WEBHOOK = os.environ.get('TREND_BOT_WEBHOOK', '')
 # 就能在未来出现类似 12-17、或 1-20 的行情时，第一时间收到提示并提前做好风控。
 
 # 进场规则（严格）
-# 上升趋势：价格 > 100-EMA 且 MACD柱 > 0 且 ADX > 25 且 +DI > -DI
-# 下降趋势：价格 < 100-EMA 且 MACD柱 < 0 且 ADX > 25 且 +DI < -DI
+# ADX 动态阈值：波动率 <2% 为 20，<4% 为 25，否则为 30
+# 上升趋势：价格 > 100-EMA 且 MACD柱 > 0 且 ADX 达标 且 +DI > -DI
+# 下降趋势：价格 < 100-EMA 且 MACD柱 < 0 且 ADX 达标 且 +DI < -DI
 
-# 出场规则（宽松）
-# 上升趋势退出： MACD柱 < 0 且 +DI < -DI 同时满足才降级为盘整（保守策略，避免过早退出）
-# 下降趋势退出： MACD柱 > 0 且 +DI > -DI 同时满足才降级为盘整
+# 出场规则
+# 主周期价格反向穿越 100-EMA、ADX < 20，或 MACD柱与 DI 同时反转时降级为盘整
 
 # 快周期二次确认
 # 如果4H级别出现反转信号，提前降级为盘整
