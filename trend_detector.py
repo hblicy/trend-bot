@@ -3,17 +3,14 @@
 """
 加密货币趋势判断机器人
 
-该程序从交易所拉取 BTC、ETH、SOL 最近 400 根 1D K 线，计算以下指标：
-1. 200-SMA（方向）
-2. MACD（动能）
+该程序从交易所拉取 BTC、ETH、SOL、BNB 最近 400 根 1D K 线，计算以下指标：
+1. 100-EMA（方向）
+2. MACD（动能，默认 8/17/6）
 3. ADX / +DI / -DI（趋势强度）
+4. 4H 快周期二次确认
 
-基于下述规则给出 Up / Down / Sideways 判断：
-• 价 > 200-SMA 且 MACD 柱>0 且 ADX>25 且 +DI>-DI → Uptrend
-• 价 < 200-SMA 且 MACD 柱<0 且 ADX>25 且 +DI<-DI → Downtrend
-• 其余 → Sideways
-
-定时（默认 4 小时）循环监控并输出最新结果
+基于 config.py 中的进场/出场规则给出 上升 / 下跌 / 盘整。
+定时报告：Asia/Shanghai 08:00 / 16:00 / 00:00；实时监控间隔见 MONITOR_INTERVAL。
 """
 
 import ccxt
@@ -22,6 +19,7 @@ import requests
 import schedule
 import time
 import datetime
+import copy
 import logging
 from logging.handlers import RotatingFileHandler
 import sys
@@ -144,14 +142,22 @@ def load_market_phase_states() -> dict:
         logger.error(f"加载市场阶段状态失败: {e}")
         return {}
 
-def init_exchange():
-    """初始化交易所对象"""
+_exchange = None
+
+
+def init_exchange(*, force_reload: bool = False):
+    """初始化交易所对象。复用连接，避免每次分析都 load_markets 拖过整点。"""
+    global _exchange
     try:
+        if _exchange is not None and not force_reload:
+            return _exchange
         ex = getattr(ccxt, EXCHANGE)({'enableRateLimit': True})
         ex.load_markets()
+        _exchange = ex
         logger.info(f"初始化{EXCHANGE}交易所成功")
         return ex
     except Exception as e:
+        _exchange = None
         logger.error(f"初始化交易所失败: {str(e)}")
         return None
 
@@ -238,44 +244,69 @@ _BEAR_SIGNAL_MESSAGES = {
     'bear_reinforcement':  '周线 MA50 向下拐头，熊市加深',
 }
 
-def _get_phase_summary(symbol: str) -> str:
-    """根据 market_phase_states 生成当前币种的阶段摘要（一行文本）。
-    如果没有任何活跃阶段则返回空字符串。
-    重启后 in-memory 的 bull/bear_market_signals 会丢失，
-    此时通过 persistent state 里存的 signal name 查 fallback 映射表。
-    """
+_PHASE_SUMMARY_PRIORITY = (
+    'bull_signal',
+    'bear_signal',
+    'breakdown',
+    'blowoff',
+    'exhaustion',
+    'bottom_reversal',
+    'capitulation',
+    'panic_sell',
+)
+
+
+def _get_phase_summary_for_key(symbol: str, state_key: str) -> str:
+    """生成指定阶段状态的一行报告摘要。"""
     state = market_phase_states.get(symbol, {})
     if not state:
         return ''
 
-    # 检查牛市信号 — 优先用 in-memory，fallback 用 signal name 查表
-    bull_sig_name = state.get('bull_signal')
-    if bull_sig_name:
+    if state_key == 'bull_signal':
+        bull_sig_name = state.get('bull_signal')
+        if not bull_sig_name:
+            return ''
         sig = bull_market_signals.get(symbol)
         if sig and sig.get('message'):
             return f"📈 {sig['message']}"
-        # fallback: 从 signal name 查静态映射
         fallback_msg = _BULL_SIGNAL_MESSAGES.get(bull_sig_name)
-        if fallback_msg:
-            return f"📈 {fallback_msg}"
+        return f"📈 {fallback_msg}" if fallback_msg else ''
 
-    # 检查熊市信号
-    bear_sig_name = state.get('bear_signal')
-    if bear_sig_name:
+    if state_key == 'bear_signal':
+        bear_sig_name = state.get('bear_signal')
+        if not bear_sig_name:
+            return ''
         sig = bear_market_signals.get(symbol)
         if sig and sig.get('message'):
             return f"📉 {sig['message']}"
         fallback_msg = _BEAR_SIGNAL_MESSAGES.get(bear_sig_name)
-        if fallback_msg:
-            return f"📉 {fallback_msg}"
+        return f"📉 {fallback_msg}" if fallback_msg else ''
 
-    # 检查形态信号 (按严重程度排序)
-    for key in ['breakdown', 'blowoff', 'exhaustion',
-                 'bottom_reversal', 'capitulation', 'panic_sell']:
-        if state.get(key):
-            label, advice = _PHASE_ADVICE[key]
-            return f"{label} — {advice}"
+    if state.get(state_key) and state_key in _PHASE_ADVICE:
+        label, advice = _PHASE_ADVICE[state_key]
+        return f"{label} — {advice}"
     return ''
+
+
+def _get_phase_summary(symbol: str) -> str:
+    """根据 market_phase_states 生成当前币种的最高优先级阶段摘要。"""
+    for state_key in _PHASE_SUMMARY_PRIORITY:
+        summary = _get_phase_summary_for_key(symbol, state_key)
+        if summary:
+            return summary
+    return ''
+
+
+def _get_new_phase_summary(symbol: str, previous_state: dict):
+    """返回本轮新出现且能写入报告正文的阶段键与摘要。"""
+    current_state = market_phase_states.get(symbol, {})
+    for state_key in _PHASE_SUMMARY_PRIORITY:
+        current_value = current_state.get(state_key)
+        if current_value and current_value != previous_state.get(state_key):
+            summary = _get_phase_summary_for_key(symbol, state_key)
+            if summary:
+                return state_key, summary
+    return None, ''
 
 
 def fetch_ohlcv(ex, symbol, timeframe=None, *, max_retries: int = 3, backoff_secs: int = 2):
@@ -291,6 +322,7 @@ def fetch_ohlcv(ex, symbol, timeframe=None, *, max_retries: int = 3, backoff_sec
     Returns:
         pd.DataFrame | None
     """
+    global _exchange
     if timeframe is None:
         timeframe = TIMEFRAME
 
@@ -309,6 +341,7 @@ def fetch_ohlcv(ex, symbol, timeframe=None, *, max_retries: int = 3, backoff_sec
                 time.sleep(wait)
             else:
                 logger.error(f"获取 {symbol} {timeframe} K 线重试{max_retries}次仍失败: {e}")
+                _exchange = None
     return None
 
 # --------- 技术信号 ----------  
@@ -541,14 +574,52 @@ def send_wechat_notification(text):
     # Fix: 空 webhook 短路，避免无意义的失败请求噪音
     if not WECHAT_WEBHOOK:
         logger.debug("WECHAT_WEBHOOK 未配置，跳过通知")
-        return
+        return False
     try:
         data = {"msgtype": "text", "text": {"content": text}}
         response = requests.post(WECHAT_WEBHOOK, json=data, timeout=10)
         response.raise_for_status()
+        result = response.json()
+        if result.get("errcode") != 0:
+            logger.error(
+                "企业微信通知返回业务错误: errcode=%s, errmsg=%s",
+                result.get("errcode"),
+                result.get("errmsg", ""),
+            )
+            return False
         logger.info("企业微信通知发送成功")
-    except Exception as e:
-        logger.error(f"发送企业微信通知失败: {str(e)}")
+        return True
+    except Exception:
+        logger.exception("发送企业微信通知失败")
+        return False
+
+
+_PHASE_ALERT_TYPES = {
+    'blowoff': '冲顶',
+    'exhaustion': '圆弧顶',
+    'breakdown': '破位',
+    'panic_sell': '加速下跌',
+    'capitulation': '砸盘探底',
+    'bottom_reversal': '底部反转',
+    'bear_signal': '熊市信号',
+    'bull_signal': '牛市信号',
+}
+
+
+def _mark_reported_phase_changes(previous_states, report_results, notified_at=None):
+    """将定时报告中首次出现的阶段信号计入独立告警冷却。"""
+    notified_at = notified_at or datetime.datetime.now()
+    for result in report_results:
+        symbol = result['symbol']
+        state_key = result.get('_reported_phase_key')
+        if not state_key:
+            continue
+        current_state = market_phase_states.get(symbol, {})
+        previous_state = previous_states.get(symbol, {})
+        current_value = current_state.get(state_key)
+        if current_value and current_value != previous_state.get(state_key):
+            phase_type = _PHASE_ALERT_TYPES[state_key]
+            current_state.setdefault('last_alerts', {})[phase_type] = notified_at
 
 def run_once(is_scheduled_report=False, report_type=None):
     """执行一次完整的趋势分析
@@ -557,7 +628,27 @@ def run_once(is_scheduled_report=False, report_type=None):
         is_scheduled_report: 是否为定时报告
         report_type: 报告类型（早间/晚间）
     """
+    scheduled_state_snapshot = None
+    scheduled_report_sent = False
+    if is_scheduled_report:
+        scheduled_state_snapshot = (
+            copy.deepcopy(market_phase_states),
+            copy.deepcopy(bull_market_signals),
+            copy.deepcopy(bear_market_signals),
+        )
+
     try:
+        if not is_scheduled_report:
+            tz = ZoneInfo(getattr(cfg, 'REPORT_TIMEZONE', 'Asia/Shanghai'))
+            now_tz = datetime.datetime.now(tz=tz)
+            report_hours = {FIRST_REPORT_HOUR, SECOND_REPORT_HOUR, THIRD_REPORT_HOUR}
+            grace = max(10, int(MONITOR_INTERVAL))
+            if now_tz.hour in report_hours and REPORT_MINUTE <= now_tz.minute <= REPORT_MINUTE + grace:
+                logger.info(
+                    f"已进入定时报告窗口 ({now_tz.strftime('%H:%M')} {tz})，中止本轮非报告分析"
+                )
+                return True
+
         if is_scheduled_report:
             logger.info(f"开始执行{report_type}定时趋势分析")
         else:
@@ -567,7 +658,7 @@ def run_once(is_scheduled_report=False, report_type=None):
         exchange = init_exchange()
         if not exchange:
             logger.error("交易所初始化失败，无法继续")
-            return
+            return False
         
         # 存储各交易对的分析结果
         results: list[dict] = []
@@ -592,6 +683,10 @@ def run_once(is_scheduled_report=False, report_type=None):
             except Exception as err:
                 logger.error(f"{symbol} 快周期获取失败: {err}")
                 fast_df = None
+
+            if is_scheduled_report and fast_df is None:
+                logger.warning(f"{symbol} 快周期数据不足，取消本次定时报告")
+                return None
 
             if len(main_df) < 2:
                 return None
@@ -649,15 +744,30 @@ def run_once(is_scheduled_report=False, report_type=None):
             trend = determine_trend(last_main_row, prev_trend, last_fast_row, prev_main_row)
 
             coin = symbol.split('/')[0]
+            previous_phase_state = copy.deepcopy(market_phase_states.get(coin, {}))
 
             if ENABLE_MARKET_PHASE_DETECTION:
-                check_market_phases(coin, main_df, safe_idx=safe_main_idx)
+                # 定时报告只把阶段写进汇总，不单独推送修复/形态信号，避免整点只收到修复信号
+                check_market_phases(
+                    coin,
+                    main_df,
+                    safe_idx=safe_main_idx,
+                    send_alert=not is_scheduled_report,
+                )
 
             # 获取实时价格 (Fix #3)
             rt_price = fetch_realtime_price(exchange, symbol)
 
             # 获取阶段摘要 (Fix #1)
             phase_summary = _get_phase_summary(coin)
+            reported_phase_key = None
+            if is_scheduled_report:
+                reported_phase_key, new_phase_summary = _get_new_phase_summary(
+                    coin,
+                    previous_phase_state,
+                )
+                if new_phase_summary:
+                    phase_summary = new_phase_summary
 
             emoji = {'上升': '', '下跌': '', '盘整': ''}[trend]
             try:
@@ -668,6 +778,7 @@ def run_once(is_scheduled_report=False, report_type=None):
                     'price': last_main_row['close'],
                     'realtime_price': rt_price,
                     'phase_summary': phase_summary,
+                    '_reported_phase_key': reported_phase_key,
                     'ema': last_main_row['EMA'],
                     'macd_hist': last_main_row.get('MACDh'),
                     'adx': last_main_row.get('ADX'),
@@ -681,15 +792,25 @@ def run_once(is_scheduled_report=False, report_type=None):
         # ---------------------------------------------------------
         # 串行执行分析 (移除线程池以保证 CCXT 稳定性)
         # ---------------------------------------------------------
+        failed_symbols = []
         for symbol in SYMBOLS:
             res = process_symbol(symbol)
             if res:
                 results.append(res)
+            else:
+                failed_symbols.append(symbol)
+
+        if is_scheduled_report and failed_symbols:
+            logger.error(
+                "定时报告数据不完整，取消发送并等待重试: %s",
+                ", ".join(failed_symbols),
+            )
+            return False
         
         # 没有结果则返回
         if not results:
             logger.warning("没有可用的分析结果")
-            return
+            return False
         
         # 生成推送消息
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -722,7 +843,11 @@ def run_once(is_scheduled_report=False, report_type=None):
         
         # 发送到企业微信
         if is_scheduled_report:
-            send_wechat_notification(text)
+            scheduled_report_sent = send_wechat_notification(text)
+            if not scheduled_report_sent:
+                logger.error(f"发送{report_type if report_type else '定时'}报告失败")
+                return False
+            _mark_reported_phase_changes(scheduled_state_snapshot[0], results)
             logger.info(f"发送{report_type if report_type else '定时'}报告成功")
         
         # 检查趋势变化并发送告警
@@ -764,11 +889,22 @@ def run_once(is_scheduled_report=False, report_type=None):
         # 在分析完成后持久化市场阶段状态，防止重启后重复告警
         save_market_phase_states(market_phase_states)
         logger.info("趋势分析完成")
+        return True
         
     except Exception as e:
         logger.error(f"执行趋势分析时发生异常: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
+        return scheduled_report_sent if is_scheduled_report else False
+    finally:
+        if is_scheduled_report and not scheduled_report_sent and scheduled_state_snapshot:
+            for current, previous in zip(
+                (market_phase_states, bull_market_signals, bear_market_signals),
+                scheduled_state_snapshot,
+            ):
+                current.clear()
+                current.update(previous)
+            logger.info("定时报告未送达，已恢复本轮之前的市场阶段状态")
 
 # 存储每个交易对的上一次趋势状态
 previous_trends = load_trend_states()
@@ -927,7 +1063,7 @@ bear_market_signals = {}
 # 存储牛市信号检测结果
 bull_market_signals = {}
 
-def check_market_phases(symbol, main_df, *, safe_idx: int = -1):
+def check_market_phases(symbol, main_df, *, safe_idx: int = -1, send_alert: bool = True):
     """检测市场阶段并发送告警
     熊市来临和牛市开启信号只监控BTC
     
@@ -935,6 +1071,7 @@ def check_market_phases(symbol, main_df, *, safe_idx: int = -1):
         symbol: 交易对名称
         main_df: 主周期数据帧
         safe_idx: 经过未收盘保护的安全索引 (Fix #4: 统一口径)
+        send_alert: 是否立即推送阶段告警。定时报告应设为 False，阶段摘要会写入趋势报告。
     
     Returns:
         dict: 市场阶段检测结果
@@ -1075,7 +1212,8 @@ def check_market_phases(symbol, main_df, *, safe_idx: int = -1):
     
     # 如果有新的市场阶段变化，发送告警
     # 注意：冷启动时（首次检测该 symbol）不发送告警，只初始化状态
-    if phase_changed and not is_cold_start:
+    # 定时报告路径 send_alert=False，避免整点只推修复信号、漏发趋势报告
+    if phase_changed and not is_cold_start and send_alert:
         # Fix #3: 按信号类型独立冷却
         last_alerts = market_phase_states[symbol].get('last_alerts', {})
         cooldown_hours = getattr(cfg, 'MARKET_PHASE_ALERT_COOLDOWN_HOURS', 6)
@@ -1211,17 +1349,42 @@ def check_market_phases(symbol, main_df, *, safe_idx: int = -1):
 def send_first_report():
     """发送第一次定时报告（上午8点）"""
     logger.info("发送上午8点定时报告")
-    run_once(is_scheduled_report=True, report_type='上午8点')
+    return run_once(is_scheduled_report=True, report_type='上午8点')
 
 def send_second_report():
     """发送第二次定时报告（下午4点）"""
     logger.info("发送下午4点定时报告")
-    run_once(is_scheduled_report=True, report_type='下午4点')
+    return run_once(is_scheduled_report=True, report_type='下午4点')
 
 def send_third_report():
     """发送第三次定时报告（凌晨0点）"""
     logger.info("发送凌晨0点定时报告")
-    run_once(is_scheduled_report=True, report_type='凌晨0点')
+    return run_once(is_scheduled_report=True, report_type='凌晨0点')
+
+
+def _run_due_report(now_tz, report_hours, last_fired_date, grace_minutes):
+    """执行当前宽限窗口内尚未成功发送的定时报告。"""
+    cur_hour = now_tz.hour
+    cur_min = now_tz.minute
+    cur_date = now_tz.date()
+    if cur_hour not in report_hours:
+        return False
+    if last_fired_date.get(cur_hour) == cur_date:
+        return False
+    if cur_min < REPORT_MINUTE or cur_min > REPORT_MINUTE + grace_minutes:
+        return False
+
+    label, report_fn = report_hours[cur_hour]
+    logger.info(
+        f"定时报告触发: {label} "
+        f"({now_tz.tzinfo} {cur_hour:02d}:{cur_min:02d})"
+    )
+    if not report_fn():
+        logger.error(f"定时报告发送失败，将在宽限窗口内重试: {label}")
+        return False
+
+    last_fired_date[cur_hour] = cur_date
+    return True
 
 def main():
     """主函数"""
@@ -1240,11 +1403,9 @@ def main():
         # 启动时立即执行一次
         run_once()
         
-        # 设置定时监控任务
-        schedule.every(MONITOR_INTERVAL).minutes.do(run_once)
-        
-        # Fix #5 round 2: DST 安全的定时报告 —— 每分钟检查一次配置时区的当前时间
-        # 不再静态换算为本地时间，而是在运行时动态判断
+        # DST 安全的定时报告：运行时按配置时区判断。
+        # 必须用宽限窗口，不能卡死在整分 —— 15 分钟监控任务一旦拖过 :00，
+        # 严格 minute==0 会漏发趋势报告，只留下监控路径里的修复/形态信号。
         report_tz = ZoneInfo(getattr(cfg, 'REPORT_TIMEZONE', 'Asia/Shanghai'))
         _report_hours = {
             FIRST_REPORT_HOUR:  ('上午8点',  send_first_report),
@@ -1252,24 +1413,43 @@ def main():
             THIRD_REPORT_HOUR:  ('凌晨0点',  send_third_report),
         }
         _last_fired_date = {}  # {hour: date}  防止同一小时内重复触发
-        
+        REPORT_GRACE_MINUTES = max(10, int(MONITOR_INTERVAL))
+
+        def _in_report_window(now_tz: datetime.datetime) -> bool:
+            return (
+                now_tz.hour in _report_hours
+                and REPORT_MINUTE <= now_tz.minute <= REPORT_MINUTE + REPORT_GRACE_MINUTES
+            )
+
         def _check_report_schedule():
-            """每分钟调用，检查配置时区的当前 hour:minute 是否匹配报告时间"""
+            """每分钟调用：目标小时内、今天还没发过，就补发报告。"""
             now_tz = datetime.datetime.now(tz=report_tz)
-            cur_hour, cur_min = now_tz.hour, now_tz.minute
-            cur_date = now_tz.date()
-            if cur_min != REPORT_MINUTE:
+            return _run_due_report(
+                now_tz,
+                _report_hours,
+                _last_fired_date,
+                REPORT_GRACE_MINUTES,
+            )
+
+        def _monitor_job():
+            """实时监控。报告窗口内让路给趋势报告，避免抢跑只推修复信号。"""
+            now_tz = datetime.datetime.now(tz=report_tz)
+            if _in_report_window(now_tz):
+                logger.info(
+                    f"处于定时报告窗口 ({now_tz.strftime('%H:%M')} {report_tz})，跳过本轮实时监控"
+                )
                 return
-            if cur_hour in _report_hours:
-                if _last_fired_date.get(cur_hour) == cur_date:
-                    return  # 今天已触发过
-                _last_fired_date[cur_hour] = cur_date
-                label, fn = _report_hours[cur_hour]
-                logger.info(f"定时报告触发: {label} ({report_tz} {cur_hour:02d}:{cur_min:02d})")
-                fn()
-        
+            run_once()
+
+        # 先注册报告检查，run_pending 时优先于监控任务
         schedule.every(1).minutes.do(_check_report_schedule)
-        logger.info(f"定时报告: 时区={report_tz}, 报告时间={[f'{h:02d}:{REPORT_MINUTE:02d}' for h in _report_hours]}")
+        schedule.every(MONITOR_INTERVAL).minutes.do(_monitor_job)
+        logger.info(
+            f"定时报告: 时区={report_tz}, "
+            f"报告时间={[f'{h:02d}:{REPORT_MINUTE:02d}' for h in _report_hours]}, "
+            f"宽限={REPORT_GRACE_MINUTES}分钟"
+        )
+        _check_report_schedule()  # 启动时若已在窗口内立即补发，不等下一分钟
         
         # 主循环
         while True:

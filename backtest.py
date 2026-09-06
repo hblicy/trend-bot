@@ -54,6 +54,90 @@ class Counters:
 # 初始化交易所
 ex = getattr(ccxt, cfg.EXCHANGE)({"enableRateLimit": True})
 
+
+def fetch_ohlcv_paginated(
+    exchange,
+    symbol: str,
+    timeframe: str,
+    *,
+    since: int,
+    total_limit: int,
+    page_limit: int = 1000,
+):
+    """按时间戳向前分页获取 OHLCV，返回去重且升序的数据。"""
+    if total_limit <= 0:
+        return []
+    if page_limit <= 0:
+        raise ValueError("page_limit 必须大于 0")
+
+    rows_by_timestamp = {}
+    cursor = since
+    while len(rows_by_timestamp) < total_limit:
+        request_limit = min(page_limit, total_limit - len(rows_by_timestamp))
+        page = exchange.fetch_ohlcv(
+            symbol,
+            timeframe=timeframe,
+            limit=request_limit,
+            since=cursor,
+        )
+        if not page:
+            break
+
+        timestamps = []
+        for row in page:
+            if not row:
+                raise ValueError(f"{symbol} {timeframe} 返回了空 K 线记录")
+            timestamp = int(row[0])
+            timestamps.append(timestamp)
+            if timestamp >= since:
+                rows_by_timestamp[timestamp] = row
+
+        next_cursor = max(timestamps) + 1
+        if next_cursor <= cursor:
+            raise RuntimeError(
+                f"{symbol} {timeframe} 分页游标未前进: "
+                f"cursor={cursor}, next_cursor={next_cursor}"
+            )
+        cursor = next_cursor
+
+        if len(page) < request_limit:
+            break
+
+    ordered_timestamps = sorted(rows_by_timestamp)
+    return [rows_by_timestamp[ts] for ts in ordered_timestamps[:total_limit]]
+
+
+def _validate_fast_coverage(
+    fast_df: pd.DataFrame,
+    first_day: pd.Timestamp,
+    last_day: pd.Timestamp,
+) -> None:
+    """确保 4H 数据覆盖回测所需日线区间。"""
+    if fast_df is None or fast_df.empty:
+        raise RuntimeError("快周期回测数据为空")
+
+    required_end = last_day + pd.Timedelta(hours=20)
+    actual_start = fast_df.index.min()
+    actual_end = fast_df.index.max()
+    if actual_start > first_day or actual_end < required_end:
+        raise RuntimeError(
+            "快周期回测数据未覆盖目标区间: "
+            f"需要 {first_day} 至 {required_end}，"
+            f"实际 {actual_start} 至 {actual_end}"
+        )
+
+    expected_days = pd.date_range(
+        first_day.normalize(),
+        last_day.normalize(),
+        freq="D",
+    )
+    available_days = pd.DatetimeIndex(fast_df.index).normalize().unique()
+    missing_days = expected_days.difference(available_days)
+    if not missing_days.empty:
+        preview = ", ".join(day.strftime("%Y-%m-%d") for day in missing_days[:5])
+        raise RuntimeError(f"快周期回测数据缺少完整日期: {preview}")
+
+
 # ----------- 评价函数 -----------
 
 def _trend_ok(direction: str, entry: float, future: pd.DataFrame) -> bool:
@@ -98,18 +182,29 @@ def backtest_symbol(sym: str) -> Tuple[Counters, Counters, List[Dict], List[Dict
     fast_df = None
     try:
         fast_limit = MAX_CANDLES * 6  # 1d ≈ 6 根 4h
-        fast_ohlcv = ex.fetch_ohlcv(sym, timeframe=cfg.FAST_TIMEFRAME, limit=fast_limit, since=since)
-        if fast_ohlcv:
-            fast_df = pd.DataFrame(fast_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            fast_df["timestamp"] = pd.to_datetime(fast_df["timestamp"], unit="ms")
-            fast_df.set_index("timestamp", inplace=True)
-            if len(fast_df) >= cfg.FAST_EMA_PERIOD:
-                fast_df = td.calculate_indicators(fast_df, "fast")
-            else:
-                fast_df = None
+        fast_ohlcv = fetch_ohlcv_paginated(
+            ex,
+            sym,
+            cfg.FAST_TIMEFRAME,
+            since=since,
+            total_limit=fast_limit,
+        )
+        fast_df = pd.DataFrame(fast_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        if fast_df.empty:
+            raise RuntimeError("快周期回测数据为空")
+        fast_df["timestamp"] = pd.to_datetime(fast_df["timestamp"], unit="ms")
+        fast_df.set_index("timestamp", inplace=True)
+
+        first_required_day = df.index[0]
+        last_required_day = df.index[len(df) - PHASE_WINDOW - 1]
+        _validate_fast_coverage(fast_df, first_required_day, last_required_day)
+        if len(fast_df) < cfg.FAST_EMA_PERIOD:
+            raise RuntimeError(
+                f"快周期回测数据不足: {len(fast_df)} < {cfg.FAST_EMA_PERIOD}"
+            )
+        fast_df = td.calculate_indicators(fast_df, "fast")
     except Exception as err:
-        print(f"  [WARN] {sym} 快周期回测数据获取失败: {err}，fast_row 将为 None")
-        fast_df = None
+        raise RuntimeError(f"{sym} 快周期回测数据获取或覆盖验证失败: {err}") from err
 
     trend_ct = Counters()
     phase_ct = Counters()
