@@ -67,7 +67,7 @@ MONITOR_INTERVAL = 15  # 实时监控间隔，建议15-30分钟
 FIRST_REPORT_HOUR = 8    # 第一次报告时间：上午8点
 SECOND_REPORT_HOUR = 16  # 第二次报告时间：下午4点
 THIRD_REPORT_HOUR = 0    # 第三次报告时间：凌晨0点
-REPORT_MINUTE = 0
+REPORT_MINUTE = 1
 # 报告时间所在的时区；运行时每分钟按此时区判断，不依赖机器本地时区
 REPORT_TIMEZONE = 'Asia/Shanghai'
 

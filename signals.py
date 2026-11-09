@@ -35,37 +35,48 @@ __all__ = [
 # 辅助函数
 # ---------------------------------------------------------------------------
 
-def _get_completed_slice(df: pd.DataFrame, tf_seconds: int = 86_400):
-    """返回最新已收盘和上一根 K 线的索引偏移 (负索引)。"""
-    if df.empty:
+def _get_completed_slice(df: pd.DataFrame, tf_seconds: int = 86_400, *, as_of_utc=None):
+    """返回指定时点已收盘的最新两根 K 线的负索引。"""
+    cutoff = (as_of_utc or datetime.datetime.utcnow()) - pd.Timedelta(seconds=tf_seconds)
+    completed = df.index.searchsorted(cutoff, side="right")
+    if completed == 0:
         return None, None
-    now_utc = datetime.datetime.utcnow()
-    last_ts = df.index[-1].to_pydatetime()
-    # 若最新 candle 尚未收盘，则使用倒数第二根作为当前
-    if (now_utc - last_ts).total_seconds() < tf_seconds:
-        curr_idx, prev_idx = -2, -3
-    else:
-        curr_idx, prev_idx = -1, -2
-    if abs(prev_idx) > len(df):
-        return None, None
-    return curr_idx, prev_idx
+    current = completed - len(df) - 1
+    return current, current - 1 if completed > 1 else None
 
 
-def _trim_incomplete_week(weekly_df: pd.DataFrame) -> pd.DataFrame:
-    """若最后一根周线未收盘(<7天)则丢弃。"""
-    if weekly_df.empty:
-        return weekly_df
-    now_utc = datetime.datetime.utcnow()
-    last_ts = weekly_df.index[-1].to_pydatetime()
-    if (now_utc - last_ts).total_seconds() < 7 * 86_400:
-        weekly_df = weekly_df.iloc[:-1]
+def _get_completed_weekly_ma50(df: pd.DataFrame, *, as_of_utc=None) -> pd.DataFrame:
+    """用已收盘的周日日 K 计算 MA50，保留缺失的最近一周。"""
+    closed_by = pd.Timestamp(as_of_utc or datetime.datetime.utcnow()) - pd.Timedelta(days=1)
+    latest_sunday = pd.offsets.Week(weekday=6).rollback(closed_by.normalize())
+    sunday = (df.index.dayofweek == 6) & (df.index <= closed_by)
+    weekly_df = df.loc[sunday, "close"].asfreq("W-SUN").to_frame()
+    if latest_sunday not in weekly_df.index:
+        weekly_df.loc[latest_sunday, "close"] = float("nan")
+    weekly_df["MA50"] = weekly_df["close"].rolling(window=50).mean()
     return weekly_df
 
 # ---------------------------------------------------------------------------
 # 牛/熊市路径监控
 # ---------------------------------------------------------------------------
 
-def detect_bull_market_signals(df: pd.DataFrame) -> dict:
+_BULL_SIGNAL_MESSAGES = {
+    "bull_early_sign": "日线收盘高于 MA200。",
+    "bull_confirmed": "日线 MA50 上穿 MA200，收盘高于 MA200 和 MA365。",
+    "bull_pullback_test": "近 10 根日 K 最低价低于两条均线中较高一条的 102%，最新收盘高于 MA200、MA365 和前一日收盘。",
+    "bull_final_verdict": "周线收盘高于 MA50。",
+    "bull_reinforcement": "周线收盘高于 MA50，MA50 较上周上升。",
+}
+_BEAR_SIGNAL_MESSAGES = {
+    "bear_warning": "日线收盘低于 MA200。",
+    "bear_confirmed": "日线 MA50 下穿 MA200，收盘低于 MA200 和 MA365。",
+    "bearish_retest": "近 10 根日 K 最高价高于两条均线中较低一条的 98%，最新收盘低于 MA200、MA365 和前一日收盘。",
+    "bear_final_verdict": "周线收盘低于 MA50。",
+    "bear_reinforcement": "周线收盘低于 MA50，MA50 较上周下降。",
+}
+
+
+def detect_bull_market_signals(df: pd.DataFrame, *, as_of_utc=None) -> dict:
     """检测牛市信号，返回 dict(signal, level, message)。"""
     try:
         if len(df) < 365:
@@ -75,16 +86,12 @@ def detect_bull_market_signals(df: pd.DataFrame) -> dict:
             if ma not in df.columns:
                 df[ma] = df["close"].rolling(window=win).mean()
 
-        curr_idx, prev_idx = _get_completed_slice(df)
-        if curr_idx is None:
+        curr_idx, prev_idx = _get_completed_slice(df, as_of_utc=as_of_utc)
+        if prev_idx is None:
             return {"signal": None, "level": None, "message": None}
         current, prev = df.iloc[curr_idx], df.iloc[prev_idx]
 
-        weekly_df = df.resample("W-SUN").agg(
-            {"close": "last", "high": "max", "low": "min", "open": lambda x: x.iloc[0] if len(x) > 0 else None}
-        )
-        weekly_df = _trim_incomplete_week(weekly_df)
-        weekly_df["MA50"] = weekly_df["close"].rolling(window=50).mean()
+        weekly_df = _get_completed_weekly_ma50(df, as_of_utc=as_of_utc)
         if len(weekly_df) < 2:
             return {"signal": None, "level": None, "message": None}
         current_weekly, prev_weekly = weekly_df.iloc[-1], weekly_df.iloc[-2]
@@ -96,30 +103,32 @@ def detect_bull_market_signals(df: pd.DataFrame) -> dict:
             result = {
                 "signal": "bull_early_sign",
                 "level": "green",
-                "message": "早期信号: 价格突破日线MA200。可尝试底仓建仓。",
+                "message": _BULL_SIGNAL_MESSAGES["bull_early_sign"],
             }
 
         # ② 确认转强
+        daily_mas = current[["MA200", "MA365"]]
+        upper_ma = daily_mas.max() if daily_mas.notna().all() else float("nan")
         golden_cross = current["MA50"] > current["MA200"] and prev["MA50"] <= prev["MA200"]
-        if current["close"] > current[["MA200", "MA365"]].max() and golden_cross:
+        if current["close"] > upper_ma and golden_cross:
             result = {
                 "signal": "bull_confirmed",
                 "level": "blue",
-                "message": "确认转强: MA50 上穿 MA200 且价格站稳 MA200/365。",
+                "message": _BULL_SIGNAL_MESSAGES["bull_confirmed"],
             }
 
         # ③ 回踩测试 (Fix #2: 用安全索引，排除未收盘 K 线)
         pos = len(df) + curr_idx if curr_idx < 0 else curr_idx
         slice_start = max(0, pos - 9)
         recent_low = df["low"].iloc[slice_start : pos + 1].min()
-        pulled_back = recent_low < max(current["MA200"], current["MA365"]) * 1.02
-        held = current["close"] > current[["MA200", "MA365"]].max()
+        pulled_back = recent_low < upper_ma * 1.02
+        held = current["close"] > upper_ma
         turning_up = current["close"] > prev["close"]
         if pulled_back and held and turning_up:
             result = {
                 "signal": "bull_pullback_test",
                 "level": "blue",
-                "message": "回踩 MA200/365 获得支撑并再次向上。",
+                "message": _BULL_SIGNAL_MESSAGES["bull_pullback_test"],
             }
 
         # ④ 最终判决
@@ -127,7 +136,7 @@ def detect_bull_market_signals(df: pd.DataFrame) -> dict:
             result = {
                 "signal": "bull_final_verdict",
                 "level": "golden",
-                "message": "周线 MA50 突破，牛市长期确认。",
+                "message": _BULL_SIGNAL_MESSAGES["bull_final_verdict"],
             }
 
         # ⑤ 趋势强化
@@ -138,7 +147,7 @@ def detect_bull_market_signals(df: pd.DataFrame) -> dict:
             result = {
                 "signal": "bull_reinforcement",
                 "level": "golden",
-                "message": "周线 MA50 向上拐头，牛市深化。",
+                "message": _BULL_SIGNAL_MESSAGES["bull_reinforcement"],
             }
 
         return result
@@ -147,7 +156,7 @@ def detect_bull_market_signals(df: pd.DataFrame) -> dict:
         return {"signal": None, "level": None, "message": None}
 
 
-def detect_bear_market_signals(df: pd.DataFrame) -> dict:
+def detect_bear_market_signals(df: pd.DataFrame, *, as_of_utc=None) -> dict:
     """检测熊市信号，逻辑与牛市对称。"""
     try:
         if len(df) < 365:
@@ -157,16 +166,12 @@ def detect_bear_market_signals(df: pd.DataFrame) -> dict:
             if ma not in df.columns:
                 df[ma] = df["close"].rolling(window=win).mean()
 
-        curr_idx, prev_idx = _get_completed_slice(df)
-        if curr_idx is None:
+        curr_idx, prev_idx = _get_completed_slice(df, as_of_utc=as_of_utc)
+        if prev_idx is None:
             return {"signal": None, "level": None, "message": None}
         current, prev = df.iloc[curr_idx], df.iloc[prev_idx]
 
-        weekly_df = df.resample("W-SUN").agg(
-            {"close": "last", "high": "max", "low": "min", "open": lambda x: x.iloc[0] if len(x) > 0 else None}
-        )
-        weekly_df = _trim_incomplete_week(weekly_df)
-        weekly_df["MA50"] = weekly_df["close"].rolling(window=50).mean()
+        weekly_df = _get_completed_weekly_ma50(df, as_of_utc=as_of_utc)
         if len(weekly_df) < 2:
             return {"signal": None, "level": None, "message": None}
         current_weekly, prev_weekly = weekly_df.iloc[-1], weekly_df.iloc[-2]
@@ -178,30 +183,32 @@ def detect_bear_market_signals(df: pd.DataFrame) -> dict:
             result = {
                 "signal": "bear_warning",
                 "level": "yellow",
-                "message": "价格跌破 MA200，警示。",
+                "message": _BEAR_SIGNAL_MESSAGES["bear_warning"],
             }
 
         # ② 确认转弱
+        daily_mas = current[["MA200", "MA365"]]
+        lower_ma = daily_mas.min() if daily_mas.notna().all() else float("nan")
         death_cross = current["MA50"] < current["MA200"] and prev["MA50"] >= prev["MA200"]
-        if current["close"] < current[["MA200", "MA365"]].min() and death_cross:
+        if current["close"] < lower_ma and death_cross:
             result = {
                 "signal": "bear_confirmed",
                 "level": "red",
-                "message": "死亡交叉且跌破 MA200/365。",
+                "message": _BEAR_SIGNAL_MESSAGES["bear_confirmed"],
             }
 
         # ③ 反弹测试 (Fix #2: 用安全索引，排除未收盘 K 线)
         pos = len(df) + curr_idx if curr_idx < 0 else curr_idx
         slice_start = max(0, pos - 9)
         recent_high = df["high"].iloc[slice_start : pos + 1].max()
-        rebounded = recent_high > min(current["MA200"], current["MA365"]) * 0.98
-        failed = current["close"] < current[["MA200", "MA365"]].min()
+        rebounded = recent_high > lower_ma * 0.98
+        failed = current["close"] < lower_ma
         turning_down = current["close"] < prev["close"]
         if rebounded and failed and turning_down:
             result = {
                 "signal": "bearish_retest",
                 "level": "red",
-                "message": "反弹受阻 MA200/365 再次下跌。",
+                "message": _BEAR_SIGNAL_MESSAGES["bearish_retest"],
             }
 
         # ④ 最终判决
@@ -209,7 +216,7 @@ def detect_bear_market_signals(df: pd.DataFrame) -> dict:
             result = {
                 "signal": "bear_final_verdict",
                 "level": "dark_red",
-                "message": "周线 MA50 跌破，熊市长期确认。",
+                "message": _BEAR_SIGNAL_MESSAGES["bear_final_verdict"],
             }
 
         # ⑤ 趋势强化
@@ -220,7 +227,7 @@ def detect_bear_market_signals(df: pd.DataFrame) -> dict:
             result = {
                 "signal": "bear_reinforcement",
                 "level": "black",
-                "message": "周线 MA50 向下拐头，熊市加深。",
+                "message": _BEAR_SIGNAL_MESSAGES["bear_reinforcement"],
             }
 
         return result
